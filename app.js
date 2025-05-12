@@ -1,261 +1,187 @@
-require('dotenv').config()
-const process = require('node:process')
-express = require('express')
-axios = require('axios').default
-botbuilder = require('botbuilder')
-const { MessageFactory, CardFactory, TurnContext } = require('botbuilder')
-localtunnel = require('localtunnel')
-tunnel = null
+require('dotenv').config();
+const process = require('node:process');
 
+const express     = require('express');
+const axios       = require('axios').default;
+const {
+  BotFrameworkAdapter,
+  MessageFactory,
+  CardFactory,
+} = require('botbuilder');
+
+const localtunnel = require('localtunnel');
+let   tunnel      = null;
+
+/* ──────────────────────────────────────────────
+   Voiceflow Dialog Manager options
+─────────────────────────────────────────────── */
 const DMconfig = {
   tts: false,
   stripSSML: false,
-}
+};
 
-// Create HTTP server.
-const app = express()
-const server = app.listen(process.env.PORT || 3978, async function () {
-  const { port } = server.address()
-  console.log(
-    '\nServer listening on port %d in %s mode',
-    port,
-    app.settings.env
-  )
-  // Setup the tunnel for testing
-  if (app.settings.env == 'development') {
+/* ──────────────────────────────────────────────
+   Web server
+─────────────────────────────────────────────── */
+const app    = express();
+const server = app.listen(process.env.PORT || 3978, async () => {
+  const { port } = server.address();
+  console.log('\nServer listening on port %d in %s mode', port, app.settings.env);
+
+  /* dev-only localtunnel helper */
+  if (app.settings.env === 'development') {
     tunnel = await localtunnel({
-      port: port,
+      port,
       subdomain: process.env.TUNNEL_SUBDOMAIN,
-    })
-    console.log(`\nEndpoint: ${tunnel.url}/api/messages`)
-    console.log(
-      `\nGet Bot Framework Emulator: https://aka.ms/botframework-emulator`
-    )
-    tunnel.on('close', () => {
-      // tunnels are closed
-      console.log('\n\nClosing tunnel')
-    })
+    });
+    console.log(`\nEndpoint: ${tunnel.url}/api/messages`);
+    console.log('Get Bot Framework Emulator: https://aka.ms/botframework-emulator');
+    tunnel.on('close', () => console.log('\nClosing tunnel'));
   }
-  console.log('\n')
+  console.log('');
 
-  var i = 0 // dots counter
-  setInterval(function () {
-    process.stdout.clearLine() // clear current text
-    process.stdout.cursorTo(0) // move cursor to beginning of line
-    i = (i + 1) % 4
-    var dots = new Array(i + 1).join('.')
-    process.stdout.write('Listening' + dots) // write text
-  }, 300)
-})
+  /* Optional spinner — run only when stdout is a TTY (avoids Azure crash) */
+  if (process.stdout.isTTY && process.stdout.clearLine) {
+    let i = 0;
+    setInterval(() => {
+      process.stdout.clearLine(0);
+      process.stdout.cursorTo(0);
+      i = (i + 1) % 4;
+      process.stdout.write('Listening' + '.'.repeat(i));
+    }, 300);
+  }
+});
 
-// Create bot adapter, which defines how the bot sends and receives messages.
-const adapter = new botbuilder.BotFrameworkAdapter({
-  appId: process.env.MicrosoftAppId,
-  appPassword: process.env.MicrosoftAppPassword,
-})
+/* ──────────────────────────────────────────────
+   Bot adapter
+─────────────────────────────────────────────── */
+const adapter = new BotFrameworkAdapter({
+  appId:
+    process.env.MicrosoftAppId      || // classic env-var
+    process.env.MICROSOFT_APP_ID,      // Azure portal name
+  appPassword:
+    process.env.MicrosoftAppPassword ||
+    process.env.MICROSOFT_APP_PASSWORD,
+});
 
-// Catch-all for errors.
-const onTurnErrorHandler = async (context, error) => {
-  // This check writes out errors to console log
-  console.error(`\n [onTurnError] unhandled error: ${error}`)
+/* Global error handler */
+adapter.onTurnError = async (context, error) => {
+  console.error('[onTurnError] unhandled error:', error);
+  await context.sendTraceActivity('OnTurnError Trace', `${error}`, 'https://www.botframework.com/schemas/error', 'TurnError');
+  await context.sendActivity('The bot encountered an error or bug.');
+  await context.sendActivity('To continue to run this bot, please fix the bot source code.');
+};
 
-  // Send a trace activity, which will be displayed in Bot Framework Emulator
-  await context.sendTraceActivity(
-    'OnTurnError Trace',
-    `${error}`,
-    'https://www.botframework.com/schemas/error',
-    'TurnError'
-  )
-
-  // Send a message to the user
-  await context.sendActivity('The bot encountered an error or bug.')
-  await context.sendActivity(
-    'To continue to run this bot, please fix the bot source code.'
-  )
-}
-// Set the onTurnError for the singleton BotFrameworkAdapter.
-adapter.onTurnError = onTurnErrorHandler
-
-// Listen for incoming requests at /api/messages.
-app.post('/api/messages', async (req, res) => {
-  // Use the adapter to process the incoming web request into a TurnContext object.
+/* ──────────────────────────────────────────────
+   Incoming requests → /api/messages
+─────────────────────────────────────────────── */
+app.post('/api/messages', (req, res) => {
   adapter.processActivity(req, res, async (turnContext) => {
-    // Do something with this incoming activity!
     if (turnContext.activity.type === 'message') {
-      const user_id = turnContext.activity.from.id
-      // Get the user's text
-      const utterance = turnContext.activity.text
-      let response = await interact(
+      const user_id   = turnContext.activity.from.id;
+      const utterance = turnContext.activity.text;
+
+      const vfResponses = await interact(
         user_id,
-        {
-          type: 'text',
-          payload: utterance,
-        },
+        { type: 'text', payload: utterance },
         turnContext
-      )
-      if (response.length > 0) {
-        await sendMessage(response, turnContext)
+      );
+
+      if (vfResponses.length) {
+        await sendMessage(vfResponses, turnContext);
       }
     }
-  })
-})
+  });
+});
 
+/* ──────────────────────────────────────────────
+   Voiceflow helper functions
+─────────────────────────────────────────────── */
 async function interact(user_id, request, turnContext) {
-  // Update {user_id} variable with DM API
-  await axios({
-    method: 'PATCH',
-    url: `${process.env.VOICEFLOW_RUNTIME_ENDPOINT}/state/user/${encodeURI(
-      user_id
-    )}/variables`,
-    headers: {
-      Authorization: process.env.VOICEFLOW_API_KEY,
-      'Content-Type': 'application/json',
-    },
-    data: {
-      user_id: user_id,
-    },
-  })
+  /* 1) update variables */
+  await axios.patch(
+    `${process.env.VOICEFLOW_RUNTIME_ENDPOINT}/state/user/${encodeURI(user_id)}/variables`,
+    { user_id },
+    {
+      headers: {
+        Authorization: process.env.VOICEFLOW_API_KEY,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
 
-  // Interact with DM API
-  let response = await axios({
-    method: 'POST',
-    url: `${process.env.VOICEFLOW_RUNTIME_ENDPOINT}/state/user/${encodeURI(
-      user_id
-    )}/interact`,
-    headers: {
-      Authorization: process.env.VOICEFLOW_API_KEY,
-      'Content-Type': 'application/json',
-      versionID: process.env.VOICEFLOW_VERSION,
-    },
-    data: {
+  /* 2) send interact request */
+  const { data } = await axios.post(
+    `${process.env.VOICEFLOW_RUNTIME_ENDPOINT}/state/user/${encodeURI(user_id)}/interact`,
+    {
       action: request,
       config: DMconfig,
     },
-  })
+    {
+      headers: {
+        Authorization: process.env.VOICEFLOW_API_KEY,
+        'Content-Type': 'application/json',
+        versionID: process.env.VOICEFLOW_VERSION,
+      },
+    }
+  );
 
-  let responses = []
-  for (let i = 0; i < response.data.length; i++) {
-    if (response.data[i].type == 'text') {
-      let tmpspeech = ''
-      for (let j = 0; j < response.data[i].payload.slate.content.length; j++) {
-        for (
-          let k = 0;
-          k < response.data[i].payload.slate.content[j].children.length;
-          k++
-        ) {
-          if (response.data[i].payload.slate.content[j].children[k].type) {
-            if (
-              response.data[i].payload.slate.content[j].children[k].type ==
-              'link'
-            ) {
-              tmpspeech +=
-                response.data[i].payload.slate.content[j].children[k].url
-            }
-          } else if (
-            response.data[i].payload.slate.content[j].children[k].text != '' &&
-            response.data[i].payload.slate.content[j].children[k].fontWeight
-          ) {
-            tmpspeech +=
-              '**' +
-              response.data[i].payload.slate.content[j].children[k].text +
-              '**'
-          } else if (
-            response.data[i].payload.slate.content[j].children[k].text != '' &&
-            response.data[i].payload.slate.content[j].children[k].italic
-          ) {
-            tmpspeech +=
-              '_' +
-              response.data[i].payload.slate.content[j].children[k].text +
-              '_'
-          } else if (
-            response.data[i].payload.slate.content[j].children[k].text != '' &&
-            response.data[i].payload.slate.content[j].children[k].underline
-          ) {
-            tmpspeech +=
-              // ignore underline
-              response.data[i].payload.slate.content[j].children[k].text
-          } else if (
-            response.data[i].payload.slate.content[j].children[k].text != '' &&
-            response.data[i].payload.slate.content[j].children[k].strikeThrough
-          ) {
-            tmpspeech +=
-              '~' +
-              response.data[i].payload.slate.content[j].children[k].text +
-              '~'
-          } else if (
-            response.data[i].payload.slate.content[j].children[k].text != ''
-          ) {
-            tmpspeech +=
-              response.data[i].payload.slate.content[j].children[k].text
-          }
+  /* 3) translate VF response → simplified array */
+  const outputs = [];
+
+  for (const step of data) {
+    if (step.type === 'text') {
+      let speech = '';
+      for (const block of step.payload.slate.content) {
+        for (const child of block.children) {
+          if (child.type === 'link')           speech += child.url;
+          else if (child.text && child.fontWeight)  speech += `**${child.text}**`;
+          else if (child.text && child.italic)      speech += `_${child.text}_`;
+          else if (child.text && child.underline)   speech += child.text; // ignore underline
+          else if (child.text && child.strikeThrough) speech += `~${child.text}~`;
+          else if (child.text)                     speech += child.text;
         }
-        tmpspeech += '\n'
+        speech += '\n';
       }
+      outputs.push({ type: 'text', value: speech });
 
-      responses.push({
-        type: 'text',
-        value: tmpspeech,
-      })
-    } else if (response.data[i].type == 'visual') {
-      responses.push({
-        type: 'image',
-        value: response.data[i].payload.image,
-      })
-    } else if (response.data[i].type == 'choice') {
-      let buttons = []
-      for (let b = 0; b < response.data[i].payload.buttons.length; b++) {
-        buttons.push({
-          label: response.data[i].payload.buttons[b].request.payload.label,
-        })
-      }
-      responses.push({
-        type: 'buttons',
-        buttons: buttons,
-      })
+    } else if (step.type === 'visual') {
+      outputs.push({ type: 'image', value: step.payload.image });
+
+    } else if (step.type === 'choice') {
+      const buttons = step.payload.buttons.map(b => ({ label: b.request.payload.label }));
+      outputs.push({ type: 'buttons', buttons });
     }
   }
 
-  let isEnding = response.data.filter(({ type }) => type === 'end')
-  if (isEnding.length > 0) {
-    console.log('\nConvo has ended')
-  }
-
-  return responses
+  if (data.some(({ type }) => type === 'end')) console.log('Convo ended');
+  return outputs;
 }
 
 async function sendMessage(messages, turnContext) {
-  let responses = []
-  for (let j = 0; j < messages.length; j++) {
-    let message = null
-    if (messages[j].type == 'image') {
-      // Image
-      const card = CardFactory.heroCard(null, [messages[j].value])
-      message = MessageFactory.attachment(card)
-    } else if (messages[j].type == 'buttons') {
-      // Buttons
-      let actions = []
-      for (let k = 0; k < messages[j].buttons.length; k++) {
-        actions.push(messages[j]?.buttons[k]?.label)
-      }
-      const card = CardFactory.heroCard(null, null, actions)
-      message = MessageFactory.attachment(card)
-    } else if (messages[j].type == 'text') {
-      // Text
-      message = messages[j].value
-    } else {
-      return
+  for (const msg of messages) {
+    let activity = null;
+
+    if (msg.type === 'image') {
+      activity = MessageFactory.attachment(CardFactory.heroCard(null, [msg.value]));
+
+    } else if (msg.type === 'buttons') {
+      const actions = msg.buttons.map(b => b.label);
+      activity = MessageFactory.attachment(CardFactory.heroCard(null, null, actions));
+
+    } else if (msg.type === 'text') {
+      activity = msg.value;
     }
-    await turnContext.sendActivity(message)
+
+    if (activity) await turnContext.sendActivity(activity);
   }
 }
 
-process.on('SIGINT', function () {
-  process.exit()
-})
-
+/* ──────────────────────────────────────────────
+   Graceful shutdown
+─────────────────────────────────────────────── */
+process.on('SIGINT', () => process.exit());
 process.on('exit', () => {
-  if (process.env.NODE_ENV == 'development') {
-    tunnel.close()
-  }
-  return console.log(`Bye!\n\n`)
-})
+  if (process.env.NODE_ENV === 'development' && tunnel) tunnel.close();
+  console.log('Bye!\n');
+});
