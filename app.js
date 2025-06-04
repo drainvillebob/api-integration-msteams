@@ -1,24 +1,58 @@
-require('dotenv').config();
-const process = require('node:process');
+/**********************************************************************
+ *  api-integration-msteams  –  multi-tenant edition
+ *  ------------------------------------------------
+ *  • Captures tenantId from every Teams message
+ *  • Upserts / refreshes a tenant row in Cosmos DB
+ *  • Pulls Voiceflow API key + version from that row (fallback to env)
+ *********************************************************************/
 
-const express     = require('express');
-const axios       = require('axios').default;
+require('dotenv').config();
+const process         = require('node:process');
+const express         = require('express');
+const axios           = require('axios').default;
+const { CosmosClient } = require('@azure/cosmos');
 const {
   BotFrameworkAdapter,
   MessageFactory,
   CardFactory,
 } = require('botbuilder');
+const localtunnel      = require('localtunnel');
 
-const localtunnel = require('localtunnel');
-let   tunnel      = null;
+/* ──────────────────────────────────────────────
+   Cosmos DB helper – one client, two tiny fns
+─────────────────────────────────────────────── */
+const cosmos = new CosmosClient({
+  endpoint: process.env.COSMOS_ENDPOINT,
+  key:      process.env.COSMOS_KEY,
+});
+const DB_ID  = 'tenant-routing';
+const COL_ID = 'items';
+const container = cosmos.database(DB_ID).container(COL_ID);
+
+/* Create or update the tenant row; return the doc */
+async function upsertTenant(tenantId) {
+  const doc = {
+    id: tenantId,
+    lastSeen: new Date().toISOString(),
+  };
+  const { resource } = await container.items.upsert(doc);
+  return resource;            // may or may not have voiceflow fields yet
+}
+
+/* Convenience accessor */
+async function getTenantConfig(tenantId) {
+  try {
+    const { resource } = await container.item(tenantId, tenantId).read();
+    return resource;
+  } catch {
+    return null;              // not found
+  }
+}
 
 /* ──────────────────────────────────────────────
    Voiceflow Dialog Manager options
 ─────────────────────────────────────────────── */
-const DMconfig = {
-  tts: false,
-  stripSSML: false,
-};
+const DMconfig = { tts: false, stripSSML: false };
 
 /* ──────────────────────────────────────────────
    Web server
@@ -30,7 +64,7 @@ const server = app.listen(process.env.PORT || 3978, async () => {
 
   /* dev-only localtunnel helper */
   if (app.settings.env === 'development') {
-    tunnel = await localtunnel({
+    const tunnel = await localtunnel({
       port,
       subdomain: process.env.TUNNEL_SUBDOMAIN,
     });
@@ -57,8 +91,8 @@ const server = app.listen(process.env.PORT || 3978, async () => {
 ─────────────────────────────────────────────── */
 const adapter = new BotFrameworkAdapter({
   appId:
-    process.env.MicrosoftAppId      || // classic env-var
-    process.env.MICROSOFT_APP_ID,      // Azure portal name
+    process.env.MicrosoftAppId ||
+    process.env.MICROSOFT_APP_ID,
   appPassword:
     process.env.MicrosoftAppPassword ||
     process.env.MICROSOFT_APP_PASSWORD,
@@ -77,19 +111,34 @@ adapter.onTurnError = async (context, error) => {
 ─────────────────────────────────────────────── */
 app.post('/api/messages', (req, res) => {
   adapter.processActivity(req, res, async (turnContext) => {
-    if (turnContext.activity.type === 'message') {
-      const user_id   = turnContext.activity.from.id;
-      const utterance = turnContext.activity.text;
+    if (turnContext.activity.type !== 'message') return;
 
-      const vfResponses = await interact(
-        user_id,
-        { type: 'text', payload: utterance },
-        turnContext
-      );
+    const user_id   = turnContext.activity.from.id;
+    const utterance = turnContext.activity.text || '';
 
-      if (vfResponses.length) {
-        await sendMessage(vfResponses, turnContext);
-      }
+    /* ---------- 1. Capture + store tenant ---------- */
+    const tenantId =
+      turnContext.activity.conversation?.tenantId ||
+      turnContext.activity.channelData?.tenant?.id ||
+      (turnContext.turnState.get('httpHeaders') || {})['x-ms-tenant-id'] ||
+      'unknown-tenant';
+
+    const tenantRow = await upsertTenant(tenantId);  // creates or refreshes
+
+    /* ---------- 2. Resolve Voiceflow creds ---------- */
+    const vfKey     = tenantRow.voiceflowSecret  || process.env.VOICEFLOW_API_KEY;
+    const vfVersion = tenantRow.voiceflowVersion || process.env.VOICEFLOW_VERSION;
+
+    /* ---------- 3. Voiceflow interaction ---------- */
+    const vfResponses = await interact(
+      user_id,
+      { type: 'text', payload: utterance },
+      vfKey,
+      vfVersion
+    );
+
+    if (vfResponses.length) {
+      await sendMessage(vfResponses, turnContext);
     }
   });
 });
@@ -97,14 +146,14 @@ app.post('/api/messages', (req, res) => {
 /* ──────────────────────────────────────────────
    Voiceflow helper functions
 ─────────────────────────────────────────────── */
-async function interact(user_id, request, turnContext) {
+async function interact(user_id, request, vfKey, vfVersion) {
   /* 1) update variables */
   await axios.patch(
     `${process.env.VOICEFLOW_RUNTIME_ENDPOINT}/state/user/${encodeURI(user_id)}/variables`,
     { user_id },
     {
       headers: {
-        Authorization: process.env.VOICEFLOW_API_KEY,
+        Authorization: vfKey,
         'Content-Type': 'application/json',
       },
     }
@@ -119,9 +168,9 @@ async function interact(user_id, request, turnContext) {
     },
     {
       headers: {
-        Authorization: process.env.VOICEFLOW_API_KEY,
+        Authorization: vfKey,
         'Content-Type': 'application/json',
-        versionID: process.env.VOICEFLOW_VERSION,
+        versionID: vfVersion,
       },
     }
   );
@@ -134,12 +183,12 @@ async function interact(user_id, request, turnContext) {
       let speech = '';
       for (const block of step.payload.slate.content) {
         for (const child of block.children) {
-          if (child.type === 'link')           speech += child.url;
+          if (child.type === 'link')                speech += child.url;
           else if (child.text && child.fontWeight)  speech += `**${child.text}**`;
           else if (child.text && child.italic)      speech += `_${child.text}_`;
-          else if (child.text && child.underline)   speech += child.text; // ignore underline
+          else if (child.text && child.underline)   speech += child.text;
           else if (child.text && child.strikeThrough) speech += `~${child.text}~`;
-          else if (child.text)                     speech += child.text;
+          else if (child.text)                      speech += child.text;
         }
         speech += '\n';
       }
@@ -181,7 +230,4 @@ async function sendMessage(messages, turnContext) {
    Graceful shutdown
 ─────────────────────────────────────────────── */
 process.on('SIGINT', () => process.exit());
-process.on('exit', () => {
-  if (process.env.NODE_ENV === 'development' && tunnel) tunnel.close();
-  console.log('Bye!\n');
-});
+process.on('exit', () => console.log('Bye!\n'));
