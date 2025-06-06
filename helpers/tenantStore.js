@@ -2,44 +2,52 @@
 import { CosmosClient } from "@azure/cosmos";
 
 // ──────────────────────────────────────────────
-//  CONFIG
+//  Cosmos client setup
 // ──────────────────────────────────────────────
 const client = new CosmosClient({
   endpoint: process.env.COSMOS_ENDPOINT,
   key:      process.env.COSMOS_KEY
 });
 
-const DB_ID  = "tenant-routing";
-const COL_ID = "items";
-const container = client.database(DB_ID).container(COL_ID);
+const DB  = "tenant-routing";
+const COL = "items";
+const container = client.database(DB).container(COL);
 
 // ──────────────────────────────────────────────
-//  upsertTenant
-//  • keeps voiceflowSecret / voiceflowVersion
-//  • refreshes lastSeen on every call
-//  • logs 404 / 401 / 403 to help debug partition-key issues
+//  upsertTenant — safe “touch” update
+//  1. PATCH /lastSeen  (does NOT overwrite doc)
+//  2. READ full doc    (returns all existing fields)
+//  Logs any Cosmos error codes for easy tracing
 // ──────────────────────────────────────────────
-export async function upsertTenant(tenantId) {
-  let existing = {};
-
+export async function upsertTenant (tenantId) {
+  // #1  PATCH lastSeen (ignore 404 if first-time tenant)
   try {
-    // Read existing doc (let SDK infer partition key by omitting 2nd arg)
-    const { resource } = await container.item(tenantId).read();
-    existing = resource || {};
+    await container
+      .item(tenantId)                       // SDK infers partition key (/id)
+      .patch([{ op: "add", path: "/lastSeen", value: new Date().toISOString() }]);
   } catch (err) {
-    // 🔎 DEBUG: log the Cosmos error code (appears in App-Service Log stream)
-    console.error("COSMOS READ ERROR →", err.code);    // 404, 401, 403, etc.
-    if (err.code !== 404) throw err;                   // bubble up real errors
+    if (err.code !== 404) {
+      console.error("COSMOS PATCH ERROR →", err.code);
+      throw err;                            // only re-throw unexpected errors
+    }
   }
 
-  // Merge timestamp onto whatever fields already exist
-  const merged = {
-    ...existing,               // keeps voiceflowSecret & voiceflowVersion
-    id: tenantId,
-    lastSeen: new Date().toISOString()
-  };
+  // #2  READ the full document (may still be 404 on very first chat)
+  let resource = {};
+  try {
+    ({ resource } = await container.item(tenantId).read());
+  } catch (err) {
+    if (err.code !== 404) {
+      console.error("COSMOS READ ERROR →", err.code);
+      throw err;
+    }
+    // create a minimal doc so future PATCH & READ succeed
+    resource = {
+      id: tenantId,
+      lastSeen: new Date().toISOString()
+    };
+    await container.items.create(resource);
+  }
 
-  // Upsert (create if absent, replace if present)
-  const { resource } = await container.items.upsert(merged);
   return resource;
 }
