@@ -128,6 +128,10 @@ app.post('/api/messages', (req, res) => {
     /* ---------- 2. Resolve Voiceflow creds ---------- */
     const vfKey     = tenantRow.voiceflowSecret  || process.env.VOICEFLOW_API_KEY;
     const vfVersion = tenantRow.voiceflowVersion || process.env.VOICEFLOW_VERSION;
+    console.log("DEBUG tenantRow =", JSON.stringify(tenantRow));
+    console.log("DEBUG chosen vfKey =", vfKey);
+    console.log("DEBUG chosen vfVersion =", vfVersion);
+
 
     /* ---------- 3. Voiceflow interaction ---------- */
     const vfResponses = await interact(
