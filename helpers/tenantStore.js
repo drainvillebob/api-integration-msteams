@@ -2,7 +2,7 @@
 import { CosmosClient } from "@azure/cosmos";
 
 // ──────────────────────────────────────────────
-//  Cosmos client setup
+//  Cosmos client
 // ──────────────────────────────────────────────
 const client = new CosmosClient({
   endpoint: process.env.COSMOS_ENDPOINT,
@@ -14,40 +14,59 @@ const COL = "items";
 const container = client.database(DB).container(COL);
 
 // ──────────────────────────────────────────────
-//  upsertTenant — safe “touch” update
-//  1. PATCH /lastSeen  (does NOT overwrite doc)
-//  2. READ full doc    (returns all existing fields)
-//  Logs any Cosmos error codes for easy tracing
+//  upsertTenant  –  “touch but never clobber”
+//  • First PATCH /lastSeen   (cheap, preserves other fields)
+//  • Then READ the full doc  (returns voiceflowSecret / version)
+//  • If READ still 404 → create minimal doc once
+//  • Debug lines show 404 / 401 and chosen document
 // ──────────────────────────────────────────────
 export async function upsertTenant (tenantId) {
-  // #1  PATCH lastSeen (ignore 404 if first-time tenant)
+  /* -------------------------------------------
+     1) Update timestamp only  (cheap RU/s)
+  --------------------------------------------*/
   try {
     await container
-      .item(tenantId)                       // SDK infers partition key (/id)
-      .patch([{ op: "add", path: "/lastSeen", value: new Date().toISOString() }]);
+      // explicit partitionKey value guarantees the correct logical partition
+      .item(tenantId, tenantId)
+      .patch([
+        { op: "add", path: "/lastSeen", value: new Date().toISOString() }
+      ]);
   } catch (err) {
     if (err.code !== 404) {
       console.error("COSMOS PATCH ERROR →", err.code);
-      throw err;                            // only re-throw unexpected errors
+      throw err;                     // unknown error – bubble up
     }
   }
 
-  // #2  READ the full document (may still be 404 on very first chat)
+  /* -------------------------------------------
+     2) Read full document
+  --------------------------------------------*/
   let resource = {};
   try {
-    ({ resource } = await container.item(tenantId).read());
+    const resp = await container.item(tenantId, tenantId).read();
+    resource = resp.resource || {};
   } catch (err) {
-    if (err.code !== 404) {
-      console.error("COSMOS READ ERROR →", err.code);
-      throw err;
-    }
-    // create a minimal doc so future PATCH & READ succeed
+    console.error("COSMOS READ ERROR →", err.code, "tenantId =", tenantId);
+    if (err.code !== 404) throw err; // only ignore 'not found'
+  }
+
+  /* -------------------------------------------
+     3) If it's the very first chat, create the doc
+  --------------------------------------------*/
+  if (!resource.id) {
     resource = {
       id: tenantId,
       lastSeen: new Date().toISOString()
+      // voiceflowSecret & voiceflowVersion will be added later in portal
     };
+
+    console.log("Creating initial tenant doc for", tenantId);
     await container.items.create(resource);
   }
 
+  /* -------------------------------------------
+     4) Return whatever we have (full doc)
+  --------------------------------------------*/
+  console.log("DEBUG tenantRow →", JSON.stringify(resource));
   return resource;
 }
