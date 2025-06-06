@@ -1,37 +1,45 @@
 // helpers/tenantStore.js
 import { CosmosClient } from "@azure/cosmos";
 
-const endpoint = process.env.COSMOS_ENDPOINT;
-const key      = process.env.COSMOS_KEY;
+// ──────────────────────────────────────────────
+//  CONFIG
+// ──────────────────────────────────────────────
+const client = new CosmosClient({
+  endpoint: process.env.COSMOS_ENDPOINT,
+  key:      process.env.COSMOS_KEY
+});
 
 const DB_ID  = "tenant-routing";
 const COL_ID = "items";
-
-const client = new CosmosClient({ endpoint, key });
 const container = client.database(DB_ID).container(COL_ID);
 
-/**
- * Upsert without clobbering existing fields.
- * Keeps voiceflowSecret & voiceflowVersion if they are present.
- */
+// ──────────────────────────────────────────────
+//  upsertTenant
+//  • keeps voiceflowSecret / voiceflowVersion
+//  • refreshes lastSeen on every call
+//  • logs 404 / 401 / 403 to help debug partition-key issues
+// ──────────────────────────────────────────────
 export async function upsertTenant(tenantId) {
-  // Try to read the existing doc (ignore 404)
   let existing = {};
+
   try {
-    const { resource } = await container.item(tenantId, tenantId).read();
+    // Read existing doc (let SDK infer partition key by omitting 2nd arg)
+    const { resource } = await container.item(tenantId).read();
     existing = resource || {};
   } catch (err) {
-    if (err.code !== 404) throw err;
+    // 🔎 DEBUG: log the Cosmos error code (appears in App-Service Log stream)
+    console.error("COSMOS READ ERROR →", err.code);    // 404, 401, 403, etc.
+    if (err.code !== 404) throw err;                   // bubble up real errors
   }
 
-  // Merge lastSeen onto previous fields
+  // Merge timestamp onto whatever fields already exist
   const merged = {
-    ...existing,
+    ...existing,               // keeps voiceflowSecret & voiceflowVersion
     id: tenantId,
     lastSeen: new Date().toISOString()
   };
 
-  // Upsert
+  // Upsert (create if absent, replace if present)
   const { resource } = await container.items.upsert(merged);
   return resource;
 }
