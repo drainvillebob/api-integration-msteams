@@ -29,14 +29,52 @@ const DB_ID  = 'tenant-routing';
 const COL_ID = 'items';
 const container = cosmos.database(DB_ID).container(COL_ID);
 
-/* Create or update the tenant row; return the doc */
+/* Create or update the tenant row while preserving existing fields */
 async function upsertTenant(tenantId) {
-  const doc = {
-    id: tenantId,
-    lastSeen: new Date().toISOString(),
-  };
-  const { resource } = await container.items.upsert(doc);
-  return resource;            // may or may not have voiceflow fields yet
+  // 1 ─ Read the existing document using the account's consistency level
+  let doc;
+  try {
+    const { resource } = await container
+      .item(tenantId, tenantId)
+      .read();
+    doc = resource;
+  } catch (err) {
+    if (err.code !== 404) {
+      console.error('COSMOS READ ERROR →', err.code, 'tenantId =', tenantId);
+      throw err;
+    }
+    // First-ever chat for this tenant ⇒ create skeleton doc
+    doc = { id: tenantId };
+    console.log('Creating new tenant record for', tenantId);
+  }
+
+  // 2 ─ Merge timestamp
+  doc.lastSeen = new Date().toISOString();
+
+  // 3 ─ Upsert with optimistic concurrency so we keep other fields
+  try {
+    const { resource: merged } = await container.items.upsert(doc, {
+      accessCondition: {
+        type: 'IfMatch',
+        condition: doc._etag ?? '*', // "*" allows first insert
+      },
+    });
+    return merged;
+  } catch (err) {
+    if (err.code !== 412) throw err; // re-throw anything but Precondition Failed
+
+    // 3a ─ 412 means we raced a newer portal save
+    console.warn('412 race - reloading latest doc for', tenantId);
+    const { resource: fresh } = await container
+      .item(tenantId, tenantId)
+      .read();
+
+    fresh.lastSeen = new Date().toISOString();
+    const { resource: merged } = await container.items.upsert(fresh, {
+      accessCondition: { type: 'IfMatch', condition: fresh._etag },
+    });
+    return merged;
+  }
 }
 
 /* Convenience accessor */
