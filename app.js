@@ -10,91 +10,22 @@ require('dotenv').config();
 const process         = require('node:process');
 const express         = require('express');
 const axios           = require('axios').default;
-const { CosmosClient } = require('@azure/cosmos');
 const {
   BotFrameworkAdapter,
   MessageFactory,
   CardFactory,
 } = require('botbuilder');
 const localtunnel      = require('localtunnel');
-
-/* ──────────────────────────────────────────────
-   Cosmos DB helper – one client, two tiny fns
-─────────────────────────────────────────────── */
-const cosmos = new CosmosClient({
-  endpoint: process.env.COSMOS_ENDPOINT,
-  key:      process.env.COSMOS_KEY,
-});
-const DB_ID  = 'tenant-routing';
-const COL_ID = 'items';
-const container = cosmos.database(DB_ID).container(COL_ID);
-
-/* Create or update the tenant row while preserving existing fields */
-async function upsertTenant(tenantId) {
-  // 1 ─ Read the existing document with strong consistency
-  let doc;
-  try {
-    const { resource } = await container
-      .item(tenantId, tenantId)
-      .read({ consistencyLevel: 'Strong' });
-    doc = resource;
-  } catch (err) {
-    if (err.code !== 404) {
-      console.error('COSMOS READ ERROR →', err.code, 'tenantId =', tenantId);
-      throw err;
-    }
-    // First-ever chat for this tenant ⇒ create skeleton doc
-    doc = { id: tenantId };
-    console.log('Creating new tenant record for', tenantId);
-  }
-
-  // 2 ─ Merge timestamp
-  doc.lastSeen = new Date().toISOString();
-
-  // 3 ─ Upsert with optimistic concurrency so we keep other fields
-  try {
-    const { resource: merged } = await container.items.upsert(doc, {
-      accessCondition: {
-        type: 'IfMatch',
-        condition: doc._etag ?? '*', // "*" allows first insert
-      },
-    });
-    return merged;
-  } catch (err) {
-    if (err.code !== 412) throw err; // re-throw anything but Precondition Failed
-
-    // 3a ─ 412 means we raced a newer portal save
-    console.warn('412 race - reloading latest doc for', tenantId);
-    const { resource: fresh } = await container
-      .item(tenantId, tenantId)
-      .read({ consistencyLevel: 'Strong' });
-
-    fresh.lastSeen = new Date().toISOString();
-    const { resource: merged } = await container.items.upsert(fresh, {
-      accessCondition: { type: 'IfMatch', condition: fresh._etag },
-    });
-    return merged;
-  }
-}
-
-/* Convenience accessor */
-async function getTenantConfig(tenantId) {
-  try {
-    const { resource } = await container.item(tenantId, tenantId).read();
-    return resource;
-  } catch {
-    return null;              // not found
-  }
-}
+const { upsertTenant, getTenantConfig } = require('./helpers/tenantStore');
 
 /* ──────────────────────────────────────────────
    Voiceflow Dialog Manager options
-─────────────────────────────────────────────── */
+────────────────────────────────────────────── */
 const DMconfig = { tts: false, stripSSML: false };
 
 /* ──────────────────────────────────────────────
    Web server
-─────────────────────────────────────────────── */
+────────────────────────────────────────────── */
 const app    = express();
 const server = app.listen(process.env.PORT || 3978, async () => {
   const { port } = server.address();
@@ -126,7 +57,7 @@ const server = app.listen(process.env.PORT || 3978, async () => {
 
 /* ──────────────────────────────────────────────
    Bot adapter
-─────────────────────────────────────────────── */
+────────────────────────────────────────────── */
 const adapter = new BotFrameworkAdapter({
   appId:
     process.env.MicrosoftAppId ||
@@ -146,7 +77,7 @@ adapter.onTurnError = async (context, error) => {
 
 /* ──────────────────────────────────────────────
    Incoming requests → /api/messages
-─────────────────────────────────────────────── */
+────────────────────────────────────────────── */
 app.post('/api/messages', (req, res) => {
   adapter.processActivity(req, res, async (turnContext) => {
     if (turnContext.activity.type !== 'message') return;
@@ -170,7 +101,6 @@ app.post('/api/messages', (req, res) => {
     console.log("DEBUG chosen vfKey =", vfKey);
     console.log("DEBUG chosen vfVersion =", vfVersion);
 
-
     /* ---------- 3. Voiceflow interaction ---------- */
     const vfResponses = await interact(
       user_id,
@@ -187,7 +117,7 @@ app.post('/api/messages', (req, res) => {
 
 /* ──────────────────────────────────────────────
    Voiceflow helper functions
-─────────────────────────────────────────────── */
+────────────────────────────────────────────── */
 async function interact(user_id, request, vfKey, vfVersion) {
   /* 1) update variables */
   await axios.patch(
@@ -270,6 +200,6 @@ async function sendMessage(messages, turnContext) {
 
 /* ──────────────────────────────────────────────
    Graceful shutdown
-─────────────────────────────────────────────── */
+────────────────────────────────────────────── */
 process.on('SIGINT', () => process.exit());
 process.on('exit', () => console.log('Bye!\n'));
