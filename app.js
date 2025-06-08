@@ -31,12 +31,12 @@ const container = cosmos.database(DB_ID).container(COL_ID);
 
 /* Create or update the tenant row while preserving existing fields */
 async function upsertTenant(tenantId) {
-  // 1 ─ Read the existing document with strong consistency
+  // 1 ─ Read the existing document using the account's consistency level
   let doc;
   try {
     const { resource } = await container
       .item(tenantId, tenantId)
-      .read({ consistencyLevel: 'Strong' });
+      .read();
     doc = resource;
   } catch (err) {
     if (err.code !== 404) {
@@ -67,7 +67,7 @@ async function upsertTenant(tenantId) {
     console.warn('412 race - reloading latest doc for', tenantId);
     const { resource: fresh } = await container
       .item(tenantId, tenantId)
-      .read({ consistencyLevel: 'Strong' });
+      .read();
 
     fresh.lastSeen = new Date().toISOString();
     const { resource: merged } = await container.items.upsert(fresh, {
