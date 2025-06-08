@@ -1,5 +1,5 @@
 // helpers/tenantStore.js
-import { CosmosClient } from "@azure/cosmos";
+const { CosmosClient } = require("@azure/cosmos");
 
 /* ───────── Cosmos client ───────── */
 const client = new CosmosClient({
@@ -12,20 +12,20 @@ const container = client
 
 /* ───────── upsertTenant ───────── */
 /**
- * • READ with strong consistency
+ * • READ using the account's consistency level
  * • If first chat, create minimal doc
  * • Merge lastSeen
  * • UPSERT with IfMatch so we never clobber
  *   a newer version written in the portal
  * • On 412, re-read freshest doc, merge, upsert again
  */
-export async function upsertTenant (tenantId) {
-  /* 1 ─ READ (strong) */
+async function upsertTenant (tenantId) {
+  /* 1 ─ READ (default consistency) */
   let doc;
   try {
     const { resource } = await container
       .item(tenantId, tenantId)                 // explicit partition key
-      .read({ consistencyLevel: "Strong" });
+      .read();
     doc = resource;
   } catch (err) {
     if (err.code !== 404) {
@@ -56,9 +56,9 @@ export async function upsertTenant (tenantId) {
     /* 3a ─ 412 means we raced a newer portal save
        → re-read freshest doc, merge again, upsert */
     console.warn("412 race - reloading latest doc for", tenantId);
-    const { resource: fresh } = await container
+      const { resource: fresh } = await container
       .item(tenantId, tenantId)
-      .read({ consistencyLevel: "Strong" });
+      .read();
 
     fresh.lastSeen = new Date().toISOString();
     const { resource: merged } = await container.items.upsert(fresh, {
@@ -68,3 +68,19 @@ export async function upsertTenant (tenantId) {
     return merged;
   }
 }
+
+async function getTenantConfig (tenantId) {
+  try {
+    const { resource } = await container
+      .item(tenantId, tenantId)
+      .read();
+    return resource;
+  } catch {
+    return null; // not found
+  }
+}
+
+module.exports = {
+  upsertTenant,
+  getTenantConfig,
+};
