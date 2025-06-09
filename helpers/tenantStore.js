@@ -26,7 +26,7 @@ async function notifyNewTenant(tenantId, userId, companyName) {
   }
 }
 
-/* ───────── Cosmos client ───────── */
+/* ───────── Cosmos client (tenant-routing) ───────── */
 const client = new CosmosClient({
   endpoint: process.env.COSMOS_ENDPOINT,
   key:      process.env.COSMOS_KEY
@@ -35,15 +35,30 @@ const container = client
   .database("tenant-routing")
   .container("items");
 
+/* ───────── Cosmos client (rag-meta) ───────── */
+const ragMetaClient = new CosmosClient({
+  endpoint: process.env.COSMOS_ENDPOINT,
+  key:      process.env.COSMOS_KEY
+});
+const ragMetaContainer = ragMetaClient
+  .database("rag-meta")
+  .container("items");
+
+/* ───────── addTenantToRagMeta ───────── */
+async function addTenantToRagMeta(tenantId, lastSeen) {
+  try {
+    const doc = {
+      id: tenantId,
+      lastSeen: lastSeen,
+    };
+    await ragMetaContainer.items.upsert(doc);
+    console.log("Added tenant to rag-meta:", tenantId);
+  } catch (err) {
+    console.error("Failed to add tenant to rag-meta:", err.message);
+  }
+}
+
 /* ───────── upsertTenant ───────── */
-/**
- * • READ using the account's consistency level
- * • If first chat, create minimal doc
- * • Merge lastSeen
- * • UPSERT with IfMatch so we never clobber
- *   a newer version written in the portal
- * • On 412, re-read freshest doc, merge, upsert again
- */
 async function upsertTenant (tenantId, userId, companyName) {
   let doc;
   let isNew = false;
@@ -53,7 +68,6 @@ async function upsertTenant (tenantId, userId, companyName) {
       .read();
     doc = resource;
     if (!doc) {
-      // Cosmos returned successfully but with no document
       doc = { id: tenantId, userId, companyName };
       isNew = true;
       console.log("Creating new tenant record for", tenantId);
@@ -77,7 +91,10 @@ async function upsertTenant (tenantId, userId, companyName) {
         condition: doc._etag ?? "*"
       }
     });
-    if (isNew) await notifyNewTenant(tenantId, userId, companyName);
+    if (isNew) {
+      await notifyNewTenant(tenantId, userId, companyName);
+      await addTenantToRagMeta(tenantId, doc.lastSeen); // <<--- ADD TO RAG-META
+    }
     return merged;
   } catch (err) {
     if (err.code !== 412) throw err;
