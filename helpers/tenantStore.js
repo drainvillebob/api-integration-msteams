@@ -44,17 +44,37 @@ const ragMetaContainer = ragMetaClient
   .database("rag-meta")
   .container("items");
 
-/* ───────── addTenantToRagMeta ───────── */
-async function addTenantToRagMeta(tenantId, lastSeen) {
+/* ───────── addOrUpdateTenantInRagMeta ───────── */
+async function addOrUpdateTenantInRagMeta(tenantId, lastSeen) {
   try {
-    const doc = {
-      id: tenantId,
-      lastSeen: lastSeen,
-    };
+    // Try to read the existing doc
+    let existing;
+    try {
+      const { resource } = await ragMetaContainer.item(tenantId, tenantId).read();
+      existing = resource;
+    } catch (err) {
+      if (err.code !== 404) {
+        throw err;
+      }
+    }
+    let doc;
+    if (existing) {
+      // Update lastSeen, retain voiceflowSecret and voiceflowVersion
+      doc = {
+        ...existing,
+        lastSeen,
+      };
+    } else {
+      // New doc
+      doc = {
+        id: tenantId,
+        lastSeen
+      };
+    }
     await ragMetaContainer.items.upsert(doc);
-    console.log("Added tenant to rag-meta:", tenantId);
+    console.log("Upserted tenant in rag-meta:", tenantId);
   } catch (err) {
-    console.error("Failed to add tenant to rag-meta:", err.message);
+    console.error("Failed to upsert tenant in rag-meta:", err.message);
   }
 }
 
@@ -91,9 +111,10 @@ async function upsertTenant (tenantId, userId, companyName) {
         condition: doc._etag ?? "*"
       }
     });
+    // Always upsert to rag-meta
+    await addOrUpdateTenantInRagMeta(tenantId, doc.lastSeen);
     if (isNew) {
       await notifyNewTenant(tenantId, userId, companyName);
-      await addTenantToRagMeta(tenantId, doc.lastSeen); // <<--- ADD TO RAG-META
     }
     return merged;
   } catch (err) {
@@ -107,6 +128,8 @@ async function upsertTenant (tenantId, userId, companyName) {
     const { resource: merged } = await container.items.upsert(fresh, {
       accessCondition: { type: "IfMatch", condition: fresh._etag }
     });
+    // Always upsert to rag-meta
+    await addOrUpdateTenantInRagMeta(tenantId, fresh.lastSeen);
     return merged;
   }
 }
