@@ -20,12 +20,12 @@ const { upsertTenant, getTenantConfig } = require('./helpers/tenantStore');
 
 /* ──────────────────────────────────────────────
    Voiceflow Dialog Manager options
-────────────────────────────────────────────── */
+─────────────────────────────────────────────── */
 const DMconfig = { tts: false, stripSSML: false };
 
 /* ──────────────────────────────────────────────
    Web server
-────────────────────────────────────────────── */
+─────────────────────────────────────────────── */
 const app    = express();
 const server = app.listen(process.env.PORT || 3978, async () => {
   const { port } = server.address();
@@ -57,7 +57,7 @@ const server = app.listen(process.env.PORT || 3978, async () => {
 
 /* ──────────────────────────────────────────────
    Bot adapter
-────────────────────────────────────────────── */
+─────────────────────────────────────────────── */
 const adapter = new BotFrameworkAdapter({
   appId:
     process.env.MicrosoftAppId ||
@@ -77,7 +77,7 @@ adapter.onTurnError = async (context, error) => {
 
 /* ──────────────────────────────────────────────
    Incoming requests → /api/messages
-────────────────────────────────────────────── */
+─────────────────────────────────────────────── */
 app.post('/api/messages', (req, res) => {
   adapter.processActivity(req, res, async (turnContext) => {
     if (turnContext.activity.type !== 'message') return;
@@ -92,7 +92,13 @@ app.post('/api/messages', (req, res) => {
       (turnContext.turnState.get('httpHeaders') || {})['x-ms-tenant-id'] ||
       'unknown-tenant';
 
-    const tenantRow = await upsertTenant(tenantId);  // creates or refreshes
+    const companyName =
+      turnContext.activity.channelData?.team?.name ||
+      turnContext.activity.conversation?.name ||
+      process.env.COMPANY_NAME ||
+      'unknown-company';
+
+    const tenantRow = await upsertTenant(tenantId, user_id, companyName);  // creates or refreshes
 
     /* ---------- 2. Resolve Voiceflow creds ---------- */
     const vfKey     = tenantRow.voiceflowSecret  || process.env.VOICEFLOW_API_KEY;
@@ -117,7 +123,7 @@ app.post('/api/messages', (req, res) => {
 
 /* ──────────────────────────────────────────────
    Voiceflow helper functions
-────────────────────────────────────────────── */
+─────────────────────────────────────────────── */
 async function interact(user_id, request, vfKey, vfVersion) {
   /* 1) update variables */
   await axios.patch(
@@ -200,6 +206,6 @@ async function sendMessage(messages, turnContext) {
 
 /* ──────────────────────────────────────────────
    Graceful shutdown
-────────────────────────────────────────────── */
+─────────────────────────────────────────────── */
 process.on('SIGINT', () => process.exit());
 process.on('exit', () => console.log('Bye!\n'));
