@@ -45,11 +45,6 @@ const ragMetaContainer = ragMetaClient
   .container("items");
 
 /* ───────── addOrUpdateTenantInRagMeta ───────── */
-/**
- * Always upserts a tenant doc in rag-meta.
- * - If doc exists, updates lastSeen and merges companyName, email, voiceflowSecret, voiceflowVersion.
- * - If doc is new, creates with all fields.
- */
 async function addOrUpdateTenantInRagMeta(tenantId, lastSeen, userId, companyName, userEmail, voiceflowSecret, voiceflowVersion) {
   try {
     let existing;
@@ -89,16 +84,6 @@ async function addOrUpdateTenantInRagMeta(tenantId, lastSeen, userId, companyNam
 }
 
 /* ───────── upsertTenant ───────── */
-/**
- * - Always upserts tenant in tenant-routing.
- * - Always upserts tenant in rag-meta, preserving existing voiceflow fields and updating lastSeen.
- * - Pass companyName and userEmail (from Teams context if available).
- * - If first creation, send notification.
- * @param {string} tenantId
- * @param {string} userId
- * @param {string} companyName
- * @param {string} userEmail
- */
 async function upsertTenant (tenantId, userId, companyName, userEmail) {
   let doc;
   let isNew = false;
