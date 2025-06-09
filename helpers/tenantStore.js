@@ -1,5 +1,30 @@
-// helpers/tenantStore.js
 const { CosmosClient } = require("@azure/cosmos");
+const nodemailer = require("nodemailer");
+
+/* ───────── Mailer setup ───────── */
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: false,
+  auth: process.env.SMTP_USER
+    ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    : undefined,
+});
+
+async function notifyNewTenant(tenantId, userId, companyName) {
+  if (!process.env.SMTP_HOST) return; // skip if not configured
+  const mail = {
+    from: process.env.SMTP_FROM || 'noreply@example.com',
+    to: 'info@askchatbots',
+    subject: `New tenant added: ${tenantId}`,
+    text: `A new tenant was created.\nTenant ID: ${tenantId}\nUser ID: ${userId}\nCompany: ${companyName}`,
+  };
+  try {
+    await transporter.sendMail(mail);
+  } catch (err) {
+    console.error('Email send failed', err.message);
+  }
+}
 
 /* ───────── Cosmos client ───────── */
 const client = new CosmosClient({
@@ -19,8 +44,9 @@ const container = client
  *   a newer version written in the portal
  * • On 412, re-read freshest doc, merge, upsert again
  */
-async function upsertTenant (tenantId) {
+async function upsertTenant (tenantId, userId, companyName) {
   let doc;
+  let isNew = false;
   try {
     const { resource } = await container
       .item(tenantId, tenantId)
@@ -31,7 +57,8 @@ async function upsertTenant (tenantId) {
       console.error("COSMOS READ ERROR →", err.code, "tenantId =", tenantId);
       throw err;
     }
-    doc = { id: tenantId };
+    doc = { id: tenantId, userId, companyName };
+    isNew = true;
     console.log("Creating new tenant record for", tenantId);
   }
 
@@ -44,6 +71,7 @@ async function upsertTenant (tenantId) {
         condition: doc._etag ?? "*"
       }
     });
+    if (isNew) await notifyNewTenant(tenantId, userId, companyName);
     return merged;
   } catch (err) {
     if (err.code !== 412) throw err;
