@@ -11,13 +11,13 @@ const transporter = nodemailer.createTransport({
     : undefined,
 });
 
-async function notifyNewTenant(tenantId, userId, companyName) {
+async function notifyNewTenant(tenantId, userId, companyName, userEmail) {
   if (!process.env.SMTP_HOST) return; // skip if not configured
   const mail = {
     from: process.env.SMTP_FROM || 'noreply@example.com',
     to: 'info@askchatbots',
     subject: `New tenant added: ${tenantId}`,
-    text: `A new tenant was created.\nTenant ID: ${tenantId}\nUser ID: ${userId}\nCompany: ${companyName}`,
+    text: `A new tenant was created.\nTenant ID: ${tenantId}\nUser ID: ${userId}\nCompany: ${companyName}\nUser Email: ${userEmail || "N/A"}`,
   };
   try {
     await transporter.sendMail(mail);
@@ -45,30 +45,40 @@ const ragMetaContainer = ragMetaClient
   .container("items");
 
 /* ───────── addOrUpdateTenantInRagMeta ───────── */
-async function addOrUpdateTenantInRagMeta(tenantId, lastSeen) {
+/**
+ * Always upserts a tenant doc in rag-meta.
+ * - If doc exists, updates lastSeen and merges companyName, email, voiceflowSecret, voiceflowVersion.
+ * - If doc is new, creates with all fields.
+ */
+async function addOrUpdateTenantInRagMeta(tenantId, lastSeen, userId, companyName, userEmail, voiceflowSecret, voiceflowVersion) {
   try {
-    // Try to read the existing doc
     let existing;
     try {
       const { resource } = await ragMetaContainer.item(tenantId, tenantId).read();
       existing = resource;
     } catch (err) {
-      if (err.code !== 404) {
-        throw err;
-      }
+      if (err.code !== 404) throw err;
     }
     let doc;
     if (existing) {
-      // Update lastSeen, retain voiceflowSecret and voiceflowVersion
       doc = {
         ...existing,
         lastSeen,
+        userId: userId || existing.userId,
+        companyName: companyName || existing.companyName,
+        email: userEmail || existing.email,
+        voiceflowSecret: voiceflowSecret || existing.voiceflowSecret,
+        voiceflowVersion: voiceflowVersion || existing.voiceflowVersion,
       };
     } else {
-      // New doc
       doc = {
         id: tenantId,
-        lastSeen
+        lastSeen,
+        userId,
+        companyName,
+        email: userEmail,
+        voiceflowSecret,
+        voiceflowVersion,
       };
     }
     await ragMetaContainer.items.upsert(doc);
@@ -79,7 +89,17 @@ async function addOrUpdateTenantInRagMeta(tenantId, lastSeen) {
 }
 
 /* ───────── upsertTenant ───────── */
-async function upsertTenant (tenantId, userId, companyName) {
+/**
+ * - Always upserts tenant in tenant-routing.
+ * - Always upserts tenant in rag-meta, preserving existing voiceflow fields and updating lastSeen.
+ * - Pass companyName and userEmail (from Teams context if available).
+ * - If first creation, send notification.
+ * @param {string} tenantId
+ * @param {string} userId
+ * @param {string} companyName
+ * @param {string} userEmail
+ */
+async function upsertTenant (tenantId, userId, companyName, userEmail) {
   let doc;
   let isNew = false;
   try {
@@ -111,10 +131,18 @@ async function upsertTenant (tenantId, userId, companyName) {
         condition: doc._etag ?? "*"
       }
     });
-    // Always upsert to rag-meta
-    await addOrUpdateTenantInRagMeta(tenantId, doc.lastSeen);
+    // Always upsert to rag-meta, passing all available fields
+    await addOrUpdateTenantInRagMeta(
+      tenantId,
+      doc.lastSeen,
+      doc.userId,
+      doc.companyName,
+      userEmail,
+      doc.voiceflowSecret,
+      doc.voiceflowVersion
+    );
     if (isNew) {
-      await notifyNewTenant(tenantId, userId, companyName);
+      await notifyNewTenant(tenantId, userId, companyName, userEmail);
     }
     return merged;
   } catch (err) {
@@ -128,8 +156,15 @@ async function upsertTenant (tenantId, userId, companyName) {
     const { resource: merged } = await container.items.upsert(fresh, {
       accessCondition: { type: "IfMatch", condition: fresh._etag }
     });
-    // Always upsert to rag-meta
-    await addOrUpdateTenantInRagMeta(tenantId, fresh.lastSeen);
+    await addOrUpdateTenantInRagMeta(
+      tenantId,
+      fresh.lastSeen,
+      fresh.userId,
+      fresh.companyName,
+      userEmail,
+      fresh.voiceflowSecret,
+      fresh.voiceflowVersion
+    );
     return merged;
   }
 }
