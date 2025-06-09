@@ -52,6 +52,12 @@ async function upsertTenant (tenantId, userId, companyName) {
       .item(tenantId, tenantId)
       .read();
     doc = resource;
+    if (!doc) {
+      // Cosmos returned successfully but with no document
+      doc = { id: tenantId, userId, companyName };
+      isNew = true;
+      console.log("Creating new tenant record for", tenantId);
+    }
   } catch (err) {
     if (err.code !== 404) {
       console.error("COSMOS READ ERROR →", err.code, "tenantId =", tenantId);
