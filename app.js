@@ -2,7 +2,7 @@
  *  api-integration-msteams  –  multi-tenant edition
  *  ------------------------------------------------
  *  • Captures tenantId from every Teams message
- *  • Upserts / refreshes a tenant row in Cosmos DB (with user email)
+ *  • Upserts / refreshes a tenant row in Cosmos DB
  *  • Pulls Voiceflow API key + version from that row (fallback to env)
  *********************************************************************/
 
@@ -14,7 +14,6 @@ const {
   BotFrameworkAdapter,
   MessageFactory,
   CardFactory,
-  TeamsInfo, // <-- import TeamsInfo for member info
 } = require('botbuilder');
 const localtunnel      = require('localtunnel');
 const { upsertTenant, getTenantConfig } = require('./helpers/tenantStore');
@@ -28,19 +27,33 @@ const DMconfig = { tts: false, stripSSML: false };
    Web server
 ─────────────────────────────────────────────── */
 const app    = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const server = app.listen(process.env.PORT || 3978, async () => {
+  const { port } = server.address();
+  console.log('\nServer listening on port %d in %s mode', port, app.settings.env);
 
-let tunnel;
-if (process.env.NODE_ENV !== 'production' && process.env.TUNNEL_SUBDOMAIN) {
-  (async () => {
-    tunnel = await localtunnel({
-      port: process.env.PORT || 3978,
-      subdomain: process.env.TUNNEL_SUBDOMAIN
+  /* dev-only localtunnel helper */
+  if (app.settings.env === 'development') {
+    const tunnel = await localtunnel({
+      port,
+      subdomain: process.env.TUNNEL_SUBDOMAIN,
     });
-    console.log(`LocalTunnel running at ${tunnel.url}`);
-  })();
-}
+    console.log(`\nEndpoint: ${tunnel.url}/api/messages`);
+    console.log('Get Bot Framework Emulator: https://aka.ms/botframework-emulator');
+    tunnel.on('close', () => console.log('\nClosing tunnel'));
+  }
+  console.log('');
+
+  /* Optional spinner — run only when stdout is a TTY (avoids Azure crash) */
+  if (process.stdout.isTTY && process.stdout.clearLine) {
+    let i = 0;
+    setInterval(() => {
+      process.stdout.clearLine(0);
+      process.stdout.cursorTo(0);
+      i = (i + 1) % 4;
+      process.stdout.write('Listening' + '.'.repeat(i));
+    }, 300);
+  }
+});
 
 /* ──────────────────────────────────────────────
    Bot adapter
@@ -85,66 +98,104 @@ app.post('/api/messages', (req, res) => {
       process.env.COMPANY_NAME ||
       'unknown-company';
 
-    // ------ NEW: Try to fetch user's email from Teams -------
-    let userEmail = null;
-    try {
-      const member = await TeamsInfo.getMember(turnContext, user_id);
-      userEmail = member.email || member.userPrincipalName || null;
-    } catch (err) {
-      console.warn('Could not fetch Teams user email:', err.message);
-    }
-
-    // Pass userEmail to upsertTenant!
-    const tenantRow = await upsertTenant(tenantId, user_id, companyName, userEmail);  // creates or refreshes
+    const tenantRow = await upsertTenant(tenantId, user_id, companyName);  // creates or refreshes
 
     /* ---------- 2. Resolve Voiceflow creds ---------- */
     const vfKey     = tenantRow.voiceflowSecret  || process.env.VOICEFLOW_API_KEY;
     const vfVersion = tenantRow.voiceflowVersion || process.env.VOICEFLOW_VERSION;
+    console.log("DEBUG tenantRow =", JSON.stringify(tenantRow));
+    console.log("DEBUG chosen vfKey =", vfKey);
+    console.log("DEBUG chosen vfVersion =", vfVersion);
 
-    /* ---------- 3. Voiceflow integration ---------- */
-    const payload = {
-      userID: user_id,
-      sessionID: tenantId,
-      action: {
-        type: 'text',
-        payload: utterance,
-      },
-      config: DMconfig,
-      state: {},
-    };
+    /* ---------- 3. Voiceflow interaction ---------- */
+    const vfResponses = await interact(
+      user_id,
+      { type: 'text', payload: utterance },
+      vfKey,
+      vfVersion
+    );
 
-    try {
-      const vfResponse = await axios.post(
-        `${process.env.VOICEFLOW_RUNTIME_ENDPOINT || 'https://general-runtime.voiceflow.com'}/state/${vfVersion}/interact`,
-        payload,
-        {
-          headers: {
-            Authorization: vfKey,
-            'Content-Type': 'application/json',
-          },
-        }
-      );
-      const messages = vfResponse.data || [];
-      await sendMessage(messages, turnContext);
-    } catch (err) {
-      console.error('[Voiceflow] Error:', err.message);
-      await turnContext.sendActivity("Sorry, I couldn't process your request right now.");
+    if (vfResponses.length) {
+      await sendMessage(vfResponses, turnContext);
     }
   });
 });
 
 /* ──────────────────────────────────────────────
-   Helper to send Voiceflow response to Teams
+   Voiceflow helper functions
 ─────────────────────────────────────────────── */
+async function interact(user_id, request, vfKey, vfVersion) {
+  /* 1) update variables */
+  await axios.patch(
+    `${process.env.VOICEFLOW_RUNTIME_ENDPOINT}/state/user/${encodeURI(user_id)}/variables`,
+    { user_id },
+    {
+      headers: {
+        Authorization: vfKey,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+
+  /* 2) send interact request */
+  const { data } = await axios.post(
+    `${process.env.VOICEFLOW_RUNTIME_ENDPOINT}/state/user/${encodeURI(user_id)}/interact`,
+    {
+      action: request,
+      config: DMconfig,
+    },
+    {
+      headers: {
+        Authorization: vfKey,
+        'Content-Type': 'application/json',
+        versionID: vfVersion,
+      },
+    }
+  );
+
+  /* 3) translate VF response → simplified array */
+  const outputs = [];
+
+  for (const step of data) {
+    if (step.type === 'text') {
+      let speech = '';
+      for (const block of step.payload.slate.content) {
+        for (const child of block.children) {
+          if (child.type === 'link')                speech += child.url;
+          else if (child.text && child.fontWeight)  speech += `**${child.text}**`;
+          else if (child.text && child.italic)      speech += `_${child.text}_`;
+          else if (child.text && child.underline)   speech += child.text;
+          else if (child.text && child.strikeThrough) speech += `~${child.text}~`;
+          else if (child.text)                      speech += child.text;
+        }
+        speech += '\n';
+      }
+      outputs.push({ type: 'text', value: speech });
+
+    } else if (step.type === 'visual') {
+      outputs.push({ type: 'image', value: step.payload.image });
+
+    } else if (step.type === 'choice') {
+      const buttons = step.payload.buttons.map(b => ({ label: b.request.payload.label }));
+      outputs.push({ type: 'buttons', buttons });
+    }
+  }
+
+  if (data.some(({ type }) => type === 'end')) console.log('Convo ended');
+  return outputs;
+}
+
 async function sendMessage(messages, turnContext) {
   for (const msg of messages) {
     let activity = null;
 
     if (msg.type === 'image') {
       activity = MessageFactory.attachment(CardFactory.heroCard(null, [msg.value]));
+
     } else if (msg.type === 'buttons') {
       const actions = msg.buttons.map(b => b.label);
       activity = MessageFactory.attachment(CardFactory.heroCard(null, null, actions));
+
     } else if (msg.type === 'text') {
       activity = msg.value;
     }
@@ -154,11 +205,7 @@ async function sendMessage(messages, turnContext) {
 }
 
 /* ──────────────────────────────────────────────
-   Start server
+   Graceful shutdown
 ─────────────────────────────────────────────── */
-const port = process.env.PORT || 3978;
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
-
-module.exports = app;
+process.on('SIGINT', () => process.exit());
+process.on('exit', () => console.log('Bye!\n'));
