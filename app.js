@@ -10,44 +10,18 @@ require('dotenv').config();
 const process         = require('node:process');
 const express         = require('express');
 const axios           = require('axios').default;
-const { CosmosClient } = require('@azure/cosmos');
 const {
   BotFrameworkAdapter,
   MessageFactory,
   CardFactory,
 } = require('botbuilder');
 const localtunnel      = require('localtunnel');
+const { upsertTenant, getTenantConfig } = require('./helpers/tenantStore');
 
 /* ──────────────────────────────────────────────
-   Cosmos DB helper – one client, two tiny fns
+   Cosmos DB helpers
 ─────────────────────────────────────────────── */
-const cosmos = new CosmosClient({
-  endpoint: process.env.COSMOS_ENDPOINT,
-  key:      process.env.COSMOS_KEY,
-});
-const DB_ID  = 'tenant-routing';
-const COL_ID = 'items';
-const container = cosmos.database(DB_ID).container(COL_ID);
-
-/* Create or update the tenant row; return the doc */
-async function upsertTenant(tenantId) {
-  const doc = {
-    id: tenantId,
-    lastSeen: new Date().toISOString(),
-  };
-  const { resource } = await container.items.upsert(doc);
-  return resource;            // may or may not have voiceflow fields yet
-}
-
-/* Convenience accessor */
-async function getTenantConfig(tenantId) {
-  try {
-    const { resource } = await container.item(tenantId, tenantId).read();
-    return resource;
-  } catch {
-    return null;              // not found
-  }
-}
+// Provided by ./helpers/tenantStore.js
 
 /* ──────────────────────────────────────────────
    Voiceflow Dialog Manager options
@@ -123,7 +97,13 @@ app.post('/api/messages', (req, res) => {
       (turnContext.turnState.get('httpHeaders') || {})['x-ms-tenant-id'] ||
       'unknown-tenant';
 
-    const tenantRow = await upsertTenant(tenantId);  // creates or refreshes
+    const companyName =
+      turnContext.activity.channelData?.team?.name ||
+      turnContext.activity.conversation?.name ||
+      process.env.COMPANY_NAME ||
+      'unknown-company';
+
+    const tenantRow = await upsertTenant(tenantId, user_id, companyName);  // creates or refreshes
 
     /* ---------- 2. Resolve Voiceflow creds ---------- */
     const vfKey     = tenantRow.voiceflowSecret  || process.env.VOICEFLOW_API_KEY;
